@@ -66,6 +66,8 @@ type LogSource = {
   format: LogFormat;
   confidence: number;
   size: string;
+  lastModified?: number;
+  fileSize?: number;
   entries: LogEntry[];
   error?: string;
 };
@@ -223,12 +225,12 @@ async function parseTextBatched(
 }
 
 async function parseStream(
-  file: File,
+  file: { stream(): ReadableStream<Uint8Array>; size: number },
   name: string,
   sourceId: string,
   onProgress?: (loaded: number, total: number) => void,
 ): Promise<LogSource> {
-  const reader = (file as Blob & { stream(): ReadableStream<Uint8Array> }).stream().getReader();
+  const reader = file.stream().getReader();
   const decoder = new TextDecoder('utf-8');
   let buffer = '';
   const entries: LogEntry[] = [];
@@ -287,35 +289,35 @@ function diagnosisFor(entry: LogEntry) {
   if (entry.level === 'ERROR') {
     if (entry.format === 'Nginx' || entry.fields.status?.startsWith('5')) {
       return {
-        title: 'Server-side request failure',
-        summary: 'A 5xx response usually points to an upstream application, dependency, or proxy timeout rather than a client-side request issue.',
-        actions: ['Check the upstream service and its error log around this timestamp.', 'Compare the request path with recent deploys and dependency health.', 'Inspect latency, retry count, and correlation identifiers before changing configuration.'],
+        title: translate('Server-side request failure'),
+        summary: translate('A 5xx response usually points to an upstream application, dependency, or proxy timeout rather than a client-side request issue.'),
+        actions: [translate('Check the upstream service and its error log around this timestamp.'), translate('Compare the request path with recent deploys and dependency health.'), translate('Inspect latency, retry count, and correlation identifiers before changing configuration.')],
       };
     }
     if (/timeout|refused|unreachable|connection/i.test(entry.message)) {
       return {
-        title: 'Dependency or network signal',
-        summary: 'The message suggests the process could not complete a network operation in the expected window.',
-        actions: ['Verify the target host, port, DNS, and service health.', 'Look for a matching trace or request id in the dependency logs.', 'Check whether retries are amplifying the failure.'],
+        title: translate('Dependency or network signal'),
+        summary: translate('The message suggests the process could not complete a network operation in the expected window.'),
+        actions: [translate('Verify the target host, port, DNS, and service health.'), translate('Look for a matching trace or request id in the dependency logs.'), translate('Check whether retries are amplifying the failure.')],
       };
     }
     return {
-      title: 'Application error',
-      summary: 'This entry is classified as an error. Use the raw line and inferred fields to trace it back to the responsible process or request.',
-      actions: ['Search nearby lines for a stack trace or preceding trigger.', 'Use the timestamp and service/process field to correlate across logs.', 'Confirm whether the error is isolated or repeating.'],
+      title: translate('Application error'),
+      summary: translate('This entry is classified as an error. Use the raw line and inferred fields to trace it back to the responsible process or request.'),
+      actions: [translate('Search nearby lines for a stack trace or preceding trigger.'), translate('Use the timestamp and service/process field to correlate across logs.'), translate('Confirm whether the error is isolated or repeating.')],
     };
   }
   if (entry.level === 'WARN') {
     return {
-      title: 'Degraded or unusual signal',
-      summary: 'Warnings are not necessarily failures, but repeated occurrences often reveal pressure before an outage.',
-      actions: ['Check the frequency of this signal across the current source.', 'Compare duration, status, or resource fields with normal entries.', 'Decide whether this should become an alert or threshold.'],
+      title: translate('Degraded or unusual signal'),
+      summary: translate('Warnings are not necessarily failures, but repeated occurrences often reveal pressure before an outage.'),
+      actions: [translate('Check the frequency of this signal across the current source.'), translate('Compare duration, status, or resource fields with normal entries.'), translate('Decide whether this should become an alert or threshold.')],
     };
   }
   return {
-    title: entry.parsed ? 'Normal operational signal' : 'Unclassified output',
-    summary: entry.parsed ? 'The parser found a useful structure in this line. The original text remains available for verification.' : 'No known structure matched this line, so it is preserved as raw output for manual inspection.',
-    actions: entry.parsed ? ['Use the inferred fields to correlate this event with related services.', 'Check surrounding lines when diagnosing a larger incident.'] : ['Look for a repeated prefix or delimiter in nearby lines.', 'If this format is common, use its fields as a parser rule candidate.'],
+    title: entry.parsed ? translate('Normal operational signal') : translate('Unclassified output'),
+    summary: entry.parsed ? translate('The parser found a useful structure in this line. The original text remains available for verification.') : translate('No known structure matched this line, so it is preserved as raw output for manual inspection.'),
+    actions: entry.parsed ? [translate('Use the inferred fields to correlate this event with related services.'), translate('Check surrounding lines when diagnosing a larger incident.')] : [translate('Look for a repeated prefix or delimiter in nearby lines.'), translate('If this format is common, use its fields as a parser rule candidate.')],
   };
 }
 
@@ -374,6 +376,28 @@ function Home() {
       localStorage.setItem(ACTIVE_SOURCE_KEY, activeSourceId);
     } catch { /* ignore */ }
   }, [activeSourceId]);
+  useEffect(() => {
+    if (!rehydrated || rehydratedOnceRef.current || !sources.length) return;
+    rehydratedOnceRef.current = true;
+    const parents = new Set<string>();
+    for (const source of sources) {
+      if (!source.path?.startsWith('/') || source.path === '/') continue;
+      const slash = source.path.lastIndexOf('/');
+      if (slash <= 0) continue;
+      parents.add(source.path.slice(0, slash));
+    }
+    if (!parents.size) return;
+    void (async () => {
+      for (const parent of parents) {
+        try {
+          const res = await fetch(`/api/list?path=${encodeURIComponent(parent)}`);
+          if (!res.ok) continue;
+          const files = (await res.json()) as Array<{ name: string; path: string; size: number; mtime: number }>;
+          if (files.length) await processRemoteFiles(files, parent, false, true, true);
+        } catch { /* ignore */ }
+      }
+    })();
+  }, [rehydrated, sources]);
   const [selectedId, setSelectedId] = useState('');
   const [query, setQuery] = useState('');
   const [levelFilter, setLevelFilter] = useState<'ALL' | Level>('ALL');
@@ -390,12 +414,15 @@ function Home() {
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [lang, setLang] = useState<Lang>(() => getStoredLang());
   useEffect(() => { storeLang(lang); }, [lang]);
-  const t = (text: string) => translate(text, lang);
+  const t = (text: string, ...args: string[]) => translate(text, lang, ...args);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
-  const watchedDirectoriesRef = useRef<Array<{ directory: DirectoryHandle; label: string }>>([]);
+  const pendingFolderLabelRef = useRef<string>('');
+  const rehydratedOnceRef = useRef(false);
 
   const activeSource = sources.find((source) => source.id === activeSourceId) ?? sources[0];
+  const activeFolder = activeSource?.path?.includes('/') ? activeSource.path.slice(0, activeSource.path.lastIndexOf('/')) : undefined;
+  const activeFolderSources = useMemo(() => activeFolder ? sources.filter((source) => source.path?.startsWith(`${activeFolder}/`)) : [], [activeFolder, sources]);
   const visibleEntries = useMemo(() => {
     if (!activeSource) return [];
     const normalized = query.trim().toLowerCase();
@@ -426,29 +453,45 @@ function Home() {
   }, [activeSource?.entries, follow, paused]);
 
 
-  const processFiles = async (files: File[], pathLabel?: string, replacePath?: string, selectFirst = true) => {
+  const processFiles = async (files: File[], pathLabel?: string, replacePath?: string, selectFirst = true, merge = false, silent = false) => {
     if (!files.length) return;
-    setLoading(true);
-    setParseError('');
-    setParseProgress(0);
+    if (!silent) {
+      setLoading(true);
+      setParseError('');
+      setParseProgress(0);
+    }
+    const currentByPath = new Map(sources.map((source) => [source.path ?? source.name, source]));
+    const toParse: { file: File; displayPath: string; id: string }[] = [];
     const nextSources: LogSource[] = [];
     for (const [index, file] of files.entries()) {
-      const id = `source-${Date.now()}-${index}`;
       const relativePath = file.webkitRelativePath || file.name;
       const filePath = pathLabel && relativePath.startsWith(`${pathLabel}/`)
         ? relativePath.slice(pathLabel.length + 1)
         : relativePath;
       const displayPath = pathLabel ? `${pathLabel.replace(/\/$/, '')}/${filePath}` : filePath;
+      const existing = currentByPath.get(displayPath);
+      const id = merge && existing ? existing.id : `source-${Date.now()}-${index}`;
+      if (merge && existing && existing.entries.length > 0 && existing.lastModified === file.lastModified && existing.fileSize === file.size) {
+        nextSources.push(existing);
+      } else {
+        toParse.push({ file, displayPath, id });
+      }
+    }
+    if (merge && !toParse.length) {
+      if (!silent) setLoading(false);
+      return;
+    }
+    for (const { file, displayPath, id } of toParse) {
       try {
         const onProgress = (loaded: number, total: number) => {
           const percent = total > 0 ? Math.round((loaded / total) * 100) : 0;
-          setParseProgress((current) => (current === percent ? current : percent));
+          if (!silent) setParseProgress((current) => (current === percent ? current : percent));
         };
         const source = await parseFileBatched(file, displayPath, id, onProgress);
-        nextSources.push({ ...source, path: displayPath });
+        nextSources.push({ ...source, path: displayPath, lastModified: file.lastModified, fileSize: file.size });
       } catch {
-        nextSources.push({ id, name: file.name, format: 'Plain text', confidence: 0, size: displaySize(file.size), entries: [], error: 'The browser could not read this file.' });
-        setParseError(`Could not read ${file.name}. Check the file permissions and try again.`);
+        nextSources.push({ id, name: file.name, format: 'Plain text', confidence: 0, size: displaySize(file.size), lastModified: file.lastModified, fileSize: file.size, entries: [], error: t('The browser could not read this file.') });
+        if (!silent) setParseError(t('Could not read {0}. Check the file permissions and try again.', file.name));
       }
     }
     if (nextSources.length) {
@@ -463,8 +506,10 @@ function Home() {
         setSelectedId(nextSources[0].entries[0]?.id ?? '');
       }
     }
-    setLoading(false);
-    setParseProgress(0);
+    if (!silent) {
+      setLoading(false);
+      setParseProgress(0);
+    }
   };
 
   const readDirectory = async (directory: DirectoryHandle) => {
@@ -475,6 +520,72 @@ function Home() {
     return files;
   };
 
+  const processRemoteFiles = async (
+    files: Array<{ name: string; path: string; size: number; mtime: number }>,
+    replacePath?: string,
+    selectFirst = true,
+    merge = false,
+    silent = false,
+  ) => {
+    if (!files.length) return;
+    if (!silent) {
+      setLoading(true);
+      setParseError('');
+      setParseProgress(0);
+    }
+    const currentByPath = new Map(sources.map((source) => [source.path ?? source.name, source]));
+    const toFetch: Array<{ name: string; path: string; size: number; mtime: number; id: string }> = [];
+    const nextSources: LogSource[] = [];
+    for (const [index, file] of files.entries()) {
+      const displayPath = file.path;
+      const existing = currentByPath.get(displayPath);
+      const id = merge && existing ? existing.id : `source-${Date.now()}-${index}`;
+      if (merge && existing && existing.entries.length > 0 && existing.lastModified === file.mtime && existing.fileSize === file.size) {
+        nextSources.push(existing);
+      } else {
+        toFetch.push({ ...file, id });
+      }
+    }
+    if (merge && !toFetch.length) {
+      if (!silent) setLoading(false);
+      return;
+    }
+    for (const { id, ...file } of toFetch) {
+      try {
+        const res = await fetch(`/api/file?path=${encodeURIComponent(file.path)}`);
+        if (!res.ok || !res.body) throw new Error('Failed to fetch file');
+        const streamFile = { stream: () => res.body, size: file.size };
+        const onProgress = (loaded: number, total: number) => {
+          const percent = total > 0 ? Math.round((loaded / total) * 100) : 0;
+          setParseProgress((current) => (current === percent ? current : percent));
+        };
+        const source = await parseStream(streamFile, file.name, id, onProgress);
+        nextSources.push({ ...source, path: file.path, lastModified: file.mtime, fileSize: file.size });
+      } catch {
+        nextSources.push({ id, name: file.name, format: 'Plain text', confidence: 0, size: displaySize(file.size), lastModified: file.mtime, fileSize: file.size, entries: [], error: t('The server could not read this file.') });
+        if (!silent) setParseError(t('Could not read {0}. Check the server permissions and try again.', file.name));
+      }
+    }
+    if (nextSources.length) {
+      setSources((current) => {
+        const retained = current.filter((source) => {
+          if (!replacePath) return true;
+          const normalized = replacePath.replace(/\/$/, '');
+          return source.path !== normalized && !source.path?.startsWith(`${normalized}/`);
+        });
+        return [...retained, ...nextSources];
+      });
+      if (selectFirst) {
+        setActiveSourceId(nextSources[0].id);
+        setSelectedId(nextSources[0].entries[0]?.id ?? '');
+      }
+    }
+    if (!silent) {
+      setLoading(false);
+      setParseProgress(0);
+    }
+  };
+
   const handleFileInput = (event: ChangeEvent<HTMLInputElement>) => {
     if (event.target.files) void processFiles(Array.from(event.target.files));
     event.target.value = '';
@@ -483,7 +594,8 @@ function Home() {
   const handleFolderInput = (event: ChangeEvent<HTMLInputElement>) => {
     const files = event.target.files ? Array.from(event.target.files) : [];
     const firstRelativePath = files[0]?.webkitRelativePath || '';
-    const folderLabel = firstRelativePath.split('/')[0] || 'selected-folder';
+    const folderLabel = pendingFolderLabelRef.current || firstRelativePath.split('/')[0] || 'selected-folder';
+    pendingFolderLabelRef.current = '';
     if (files.length) void processFiles(files, folderLabel, folderLabel);
     event.target.value = '';
   };
@@ -494,22 +606,22 @@ function Home() {
     if (event.dataTransfer.files?.length) void processFiles(Array.from(event.dataTransfer.files));
   };
 
+  const openFolderInput = () => {
+    const input = folderInputRef.current;
+    if (!input) return;
+    input.setAttribute('webkitdirectory', '');
+    input.setAttribute('directory', '');
+    input.click();
+  };
+
   const chooseFolder = async () => {
     const picker = (window as DirectoryPickerWindow).showDirectoryPicker;
-    const openFolderInput = () => {
-      const input = folderInputRef.current;
-      if (!input) return;
-      input.setAttribute('webkitdirectory', '');
-      input.setAttribute('directory', '');
-      input.click();
-    };
     if (picker) {
       try {
         const directory = await picker();
-        const label = directory.name || 'selected-folder';
         const files = await readDirectory(directory);
-        watchedDirectoriesRef.current = [...watchedDirectoriesRef.current, { directory, label }];
-        void processFiles(files, label, label);
+        const label = directory.name || 'selected-folder';
+        await processFiles(files, label, label, true, true);
       } catch (error) {
         if (errorIsNotCancellation(error)) openFolderInput();
       }
@@ -521,52 +633,25 @@ function Home() {
   const connectCustomPath = async () => {
     const requestedPath = customPath.trim();
     if (!requestedPath) {
-      setParseError('Enter a local path first, for example /var/log/nginx or C:\\\\logs.');
-      return;
-    }
-    const isFileLike = !requestedPath.endsWith('/') && !requestedPath.endsWith('\\') && (requestedPath.split(/[\\\\/]/).pop() ?? '').includes('.');
-    const handleKey = `handle:${requestedPath.replace(/[\\\\/]+$/, '')}`;
-    if (isFileLike) {
-      const picker = (window as DirectoryPickerWindow).showOpenFilePicker;
-      if (!picker) {
-        setParseError('This browser cannot open a file by path. Use Browse files or a current Chromium-based browser.');
-        return;
-      }
-      try {
-        const savedHandle = await loadFromStore<unknown>(handleKey);
-        const handles = await picker(savedHandle ? { multiple: false, startIn: savedHandle } : { multiple: false });
-        const handle = handles[0];
-        if (!handle) return;
-        void saveToStore(handleKey, handle).catch(() => {});
-        const file = await handle.getFile();
-        const lastSep = Math.max(requestedPath.lastIndexOf('/'), requestedPath.lastIndexOf('\\'));
-        const parent = lastSep > 0 ? requestedPath.slice(0, lastSep) : '';
-        await processFiles([file], parent, parent);
-        setShowPathHelp(false);
-      } catch (error) {
-        if (errorIsNotCancellation(error)) {
-          setParseError(`Could not open ${requestedPath}. Check the browser permission and try again.`);
-        }
-      }
-      return;
-    }
-    const picker = (window as DirectoryPickerWindow).showDirectoryPicker;
-    if (!picker) {
-      setParseError('This browser cannot grant folder access. The path is not readable by a frontend alone; use Browse files or a current Chromium-based browser.');
+      setParseError(t('Enter a server path first, for example /var/log/nginx or /var/log.'));
       return;
     }
     try {
-      const savedHandle = await loadFromStore<unknown>(handleKey);
-      const directory = savedHandle ? await picker({ startIn: savedHandle }) : await picker();
-      const files = await readDirectory(directory);
-      watchedDirectoriesRef.current = [...watchedDirectoriesRef.current, { directory, label: requestedPath }];
-      void saveToStore(handleKey, directory).catch(() => {});
-      await processFiles(files, requestedPath, requestedPath);
-      setShowPathHelp(false);
-    } catch (error) {
-      if (errorIsNotCancellation(error)) {
-        setParseError(`Could not connect ${requestedPath}. Check the browser permission and try again.`);
+      const res = await fetch(`/api/list?path=${encodeURIComponent(requestedPath)}`);
+      if (!res.ok) {
+        const text = await res.text().catch(() => 'Server error');
+        setParseError(t('Could not connect {0}: {1}.', requestedPath, `${res.status} ${text}`));
+        return;
       }
+      const files = (await res.json()) as Array<{ name: string; path: string; size: number; mtime: number }>;
+      if (!files.length) {
+        setParseError(t('No files found at {0}.', requestedPath));
+        return;
+      }
+      await processRemoteFiles(files, requestedPath, true, true);
+      setShowPathHelp(false);
+    } catch {
+      setParseError(t('Could not reach the server. Make sure the backend is running.'));
     }
   };
 
@@ -578,28 +663,17 @@ function Home() {
   };
 
   const removeSource = (id: string) => {
-    setSources((current) => current.filter((source) => source.id !== id));
+    setSources((current) => {
+      const next = current.filter((source) => source.id !== id);
+      void saveToStore('sources', next).catch(() => {});
+      return next;
+    });
     if (activeSourceId === id) {
       setActiveSourceId('');
       setSelectedId('');
       setDetailsOpen(false);
     }
   };
-
-  useEffect(() => {
-    if (!follow || paused || !watchedDirectoriesRef.current.length) return undefined;
-    const timer = window.setInterval(async () => {
-      for (const watch of watchedDirectoriesRef.current) {
-        try {
-          const files = await readDirectory(watch.directory);
-          await processFiles(files, watch.label, watch.label, false);
-        } catch {
-          setParseError(`Lost access to ${watch.label}. Reconnect the path to resume local monitoring.`);
-        }
-      }
-    }, 2500);
-    return () => window.clearInterval(timer);
-  }, [follow, paused]);
 
   useEffect(() => {
     if (!detailsOpen) return undefined;
@@ -633,12 +707,12 @@ function Home() {
       <aside className="sidebar">
         <div className="brand">
           <div className="brand-mark"><Activity size={16} strokeWidth={2.5} /></div>
-          <div><div className="brand-name">Log Monitor</div><div className="brand-subtitle">local operations cockpit</div></div>
+          <div><div className="brand-name">{t('Log Monitor')}</div><div className="brand-subtitle">{t('local operations cockpit')}</div></div>
         </div>
         <nav aria-label="Primary navigation">
-          <div className="nav-label">Workspace</div>
+          <div className="nav-label">{t('Workspace')}</div>
           <div className="nav-list">
-            <button className="nav-item active" data-testid="button-nav-monitor" onClick={() => setActiveSourceId(activeSourceId)}><Gauge size={16} /> Monitor</button>
+            <button className="nav-item active" data-testid="button-nav-monitor" onClick={() => setActiveSourceId(activeSourceId)}><Gauge size={16} /> {t('Monitor')}</button>
             <button className="nav-item" data-testid="button-nav-sources" onClick={() => fileInputRef.current?.click()}><Plus size={16} /> {t('Add source')}</button>
           </div>
         </nav>
@@ -665,7 +739,7 @@ function Home() {
 
         <div className="workspace">
           {!parserSupported && <div className="unsupported-banner" data-testid="state-unsupported"><AlertTriangle size={15} /> {t('This browser does not expose the File API. Upgrade to a current browser to open local logs.')}</div>}
-          {parseError && <div className="error-banner" data-testid="state-parse-error"><AlertTriangle size={15} /><span>{parseError}</span><button className="icon-button" data-testid="button-dismiss-error" aria-label="Dismiss error" onClick={() => setParseError('')}><X size={14} /></button></div>}
+          {parseError && <div className="error-banner" data-testid="state-parse-error"><AlertTriangle size={15} /><span>{parseError}</span><button className="icon-button" data-testid="button-dismiss-error" aria-label={t('Dismiss error')} onClick={() => setParseError('')}><X size={14} /></button></div>}
           <div className="heading-row">
             <div>
               <div className="eyebrow">{t('Operations / local session')}</div>
@@ -683,33 +757,33 @@ function Home() {
             <div className="path-connect-form">
               <input className="path-input" data-testid="input-custom-path" value={customPath} onChange={(event) => setCustomPath(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') void connectCustomPath(); }} placeholder="/var/log/nginx" aria-label={t('Custom local log path')} />
               <button type="button" className="button" data-testid="button-connect-path" aria-label={t('Connect this local log path')} onClick={() => void connectCustomPath()}><Link2 size={13} /> {t('Connect path')}</button>
-              <button className="path-help" data-testid="button-path-help" onClick={() => setShowPathHelp((value) => !value)} aria-label="Explain custom path access">?</button>
+              <button className="path-help" data-testid="button-path-help" onClick={() => setShowPathHelp((value) => !value)} aria-label={t('Explain custom path access')}>?</button>
             </div>
             {showPathHelp && <p className="path-help-text" data-testid="text-path-help">{t('Browsers cannot read an arbitrary filesystem path from text alone. The path becomes the source label, while the folder picker is the secure permission step. Nothing leaves this tab.')}</p>}
           </div>
 
-          <section className="stat-grid" aria-label="Session summary">
+          <section className="stat-grid" aria-label={t('Session summary')}>
             <div className="stat-card accent"><div className="stat-label"><span>{t('Sources online')}</span><CheckCircle2 size={14} /></div><div className="stat-value" data-testid="text-source-count">{sources.length.toString().padStart(2, '0')}</div><div className="stat-detail good">{t('local files in session')}</div></div>
             <div className="stat-card"><div className="stat-label"><span>{t('Entries indexed')}</span><Archive size={14} /></div><div className="stat-value" data-testid="text-entry-count">{allEntries.length.toLocaleString()}</div><div className="stat-detail">{visibleEntries.length.toLocaleString()} {t('matching current view')}</div></div>
-            <div className="stat-card"><div className="stat-label"><span>{t('Errors / warnings')}</span><AlertTriangle size={14} /></div><div className="stat-value" data-testid="text-problem-count">{(levelCounts.ERROR + levelCounts.WARN).toString().padStart(2, '0')}</div><div className="stat-detail">{levelCounts.ERROR} errors · {levelCounts.WARN} warnings</div></div>
-            <div className="stat-card"><div className="stat-label"><span>{t('Parser confidence')}</span><BarChart3 size={14} /></div><div className="stat-value" data-testid="text-confidence">{activeSource ? `${activeSource.confidence}%` : '—'}</div><div className="stat-detail">{activeSource?.format ?? t('No source selected')}</div></div>
+            <div className="stat-card"><div className="stat-label"><span>{t('Errors / warnings')}</span><AlertTriangle size={14} /></div><div className="stat-value" data-testid="text-problem-count">{(levelCounts.ERROR + levelCounts.WARN).toString().padStart(2, '0')}</div><div className="stat-detail">{t('{0} errors · {1} warnings', levelCounts.ERROR.toString(), levelCounts.WARN.toString())}</div></div>
+            <div className="stat-card"><div className="stat-label"><span>{t('Parser confidence')}</span><BarChart3 size={14} /></div><div className="stat-value" data-testid="text-confidence">{activeSource ? `${activeSource.confidence}%` : '—'}</div><div className="stat-detail">{activeSource ? t(activeSource.format) : t('No source selected')}</div></div>
           </section>
 
           <section className="monitor-grid" aria-label="Log monitor">
             <aside className="source-panel">
               <div className="panel-heading"><span>{t('Sources')}</span><button className="icon-button" data-testid="button-add-source" aria-label={t('Add a log source')} onClick={() => fileInputRef.current?.click()}><Plus size={14} /></button><button className="icon-button" data-testid="button-remove-source" aria-label={t('Remove active source')} onClick={() => activeSource && removeSource(activeSource.id)} disabled={!activeSource}><X size={14} /></button></div>
-               {loading ? <div className="source-list"><div className="source-item skeleton" style={{ height: 62 }} /><div className="source-item skeleton" style={{ height: 62 }} /></div> : sources.length ? <div className="source-list">{sources.map((source) => <button key={source.id} className={`source-item ${source.id === activeSource?.id ? 'active' : ''}`} data-testid={`button-source-${source.id}`} onClick={() => { setActiveSourceId(source.id); setSelectedId(source.entries[0]?.id ?? ''); }}><div className="source-name"><span className="source-icon">{sourceIcon(source.format)}</span><span>{source.name}</span></div><div className="source-meta"><span className="source-format">{source.format}</span><span className={`tiny-dot ${source.error ? 'error' : ''}`} /></div>{source.path && source.path !== source.name && <div className="source-path">{source.path}</div>}</button>)}</div> : <div className="source-empty" data-testid="state-empty-sources">{t('No sources yet. Open a file or drop a folder to begin.')}</div>}
+               {loading ? <div className="source-list"><div className="source-item skeleton" style={{ height: 62 }} /><div className="source-item skeleton" style={{ height: 62 }} /></div> : sources.length ? <div className="source-list">{sources.map((source) => <button key={source.id} className={`source-item ${source.id === activeSource?.id ? 'active' : ''}`} data-testid={`button-source-${source.id}`} onClick={() => { setActiveSourceId(source.id); setSelectedId(source.entries[0]?.id ?? ''); }}><div className="source-name"><span className="source-icon">{sourceIcon(source.format)}</span><span>{source.name}</span></div><div className="source-meta"><span className="source-format">{t(source.format)}</span><span className={`tiny-dot ${source.error ? 'error' : ''}`} /></div>{source.path && source.path !== source.name && <div className="source-path">{source.path}</div>}</button>)}</div> : <div className="source-empty" data-testid="state-empty-sources">{t('No sources yet. Open a file or drop a folder to begin.')}</div>}
             </aside>
 
             <div className="log-panel">
               <div className="log-toolbar">
                 <div className="search-wrap"><Search size={15} /><input className="search-input" data-testid="input-search-logs" type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t('Search message, field, raw line…')} /></div>
                 <select className="filter-select" data-testid="select-level-filter" value={levelFilter} onChange={(event) => setLevelFilter(event.target.value as 'ALL' | Level)} aria-label={t('Filter by level')}><option value="ALL">{t('All levels')}</option><option value="ERROR">{t('Errors')}</option><option value="WARN">{t('Warnings')}</option><option value="INFO">{t('Info')}</option><option value="DEBUG">{t('Debug')}</option><option value="TRACE">{t('Trace')}</option></select>
-                <div className="view-toggle" aria-label="Log view"><button className={view === 'table' ? 'active' : ''} data-testid="button-view-table" aria-label="Table view" onClick={() => setView('table')}><Table2 size={14} /></button><button className={view === 'list' ? 'active' : ''} data-testid="button-view-list" aria-label="Readable list view" onClick={() => setView('list')}><LayoutList size={14} /></button></div>
+                <div className="view-toggle" aria-label={t('Log view')}><button className={view === 'table' ? 'active' : ''} data-testid="button-view-table" aria-label={t('Table view')} onClick={() => setView('table')}><Table2 size={14} /></button><button className={view === 'list' ? 'active' : ''} data-testid="button-view-list" aria-label={t('Readable list view')} onClick={() => setView('list')}><LayoutList size={14} /></button></div>
               </div>
-                 <div className="live-controls"><span className={`live-pill ${paused ? 'paused' : ''}`} data-testid="status-live"><span className="status-dot" /> {paused ? t('Paused') : t('Live view')}</span><strong>{activeSource ? activeSource.name : t('No source')}</strong><span className="mono">{visibleEntries.length} {t('shown')}</span><button className="control-link" data-testid="button-open-live-details" onClick={() => selectedEntry && openDetails(selectedEntry)} disabled={!selectedEntry}><Maximize2 size={13} /> {t('Inspect details')}</button><button className="control-link" data-testid="button-toggle-follow" onClick={() => setFollow((value) => !value)}>{follow ? <CirclePause size={14} /> : <CirclePlay size={14} />} {follow ? t('Following') : t('Follow')}</button><button className="control-link" data-testid="button-toggle-pause" onClick={() => setPaused((value) => !value)}>{paused ? <Play size={13} /> : <Pause size={13} />} {paused ? t('Resume') : t('Pause')}</button><button className="control-link" data-testid="button-clear-logs" onClick={clearActive} disabled={!activeSource?.entries.length}><Trash2 size={13} /> {t('Clear')}</button></div>
+                 <div className="live-controls"><span className={`live-pill ${paused ? 'paused' : ''}`} data-testid="status-live"><span className="status-dot" /> {paused ? t('Paused') : t('Live view')}</span>{activeSource ? (activeFolderSources.length > 1 ? <select className="filter-select" data-testid="select-folder-files" value={activeSource.id} onChange={(event) => { setActiveSourceId(event.target.value); setSelectedId(''); }} aria-label={t('Sources')}>{activeFolderSources.map((source) => <option key={source.id} value={source.id}>{source.name}</option>)}</select> : <strong>{activeSource.name}</strong>) : <strong>{t('No source')}</strong>}<span className="mono">{visibleEntries.length} {t('shown')}</span><button className="control-link" data-testid="button-open-live-details" onClick={() => selectedEntry && openDetails(selectedEntry)} disabled={!selectedEntry}><Maximize2 size={13} /> {t('Inspect details')}</button><button className="control-link" data-testid="button-toggle-follow" onClick={() => setFollow((value) => !value)}>{follow ? <CirclePause size={14} /> : <CirclePlay size={14} />} {follow ? t('Following') : t('Follow')}</button><button className="control-link" data-testid="button-toggle-pause" onClick={() => setPaused((value) => !value)}>{paused ? <Play size={13} /> : <Pause size={13} />} {paused ? t('Resume') : t('Pause')}</button><button className="control-link" data-testid="button-clear-logs" onClick={clearActive} disabled={!activeSource?.entries.length}><Trash2 size={13} /> {t('Clear')}</button></div>
               <div className="log-scroll">
-                 {loading ? <div className="empty-logs"><div><div className="skeleton" style={{ width: 180, height: 10, margin: '0 auto 14px' }} /><div className="skeleton" style={{ width: 270, height: 10, margin: '0 auto 8px' }} /><div className="skeleton" style={{ width: 220, height: 10, margin: '0 auto' }} /></div></div> : !activeSource || !visibleEntries.length ? <div className="empty-logs" data-testid="state-empty-logs"><List size={24} /><div><h3>{activeSource?.entries.length ? t('No matching entries') : t('Nothing to inspect yet')}</h3><p>{activeSource?.entries.length ? t('Try a different search term or level filter.') : t('Open a local log and the monitor will keep its raw lines alongside every inferred field.')}</p></div></div> : view === 'table' ? <table className="log-table"><thead><tr><th>#</th><th>Timestamp</th><th>Level</th><th>Message / inferred fields</th></tr></thead><tbody>{displayedEntries.map((entry) => <tr key={entry.id} className={`log-row ${selectedEntry?.id === entry.id ? 'selected' : ''}`} data-testid={`row-log-${entry.id}`} tabIndex={0} role="button" aria-label={`Inspect line ${entry.line}: ${entry.message}`} onClick={() => setSelectedId(entry.id)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') setSelectedId(entry.id); }}><td className="line-number">{String(entry.line).padStart(4, '0')}</td><td className="time-cell">{entry.timestamp}</td><td><span className={`level-badge ${entry.level.toLowerCase()}`}>{entry.level}</span></td><td className="message-cell"><div>{entry.message}</div>{Object.entries(entry.fields).length > 0 && <div style={{ marginTop: 5 }}>{Object.entries(entry.fields).slice(0, 4).map(([key, value]) => <span className="field-chip" key={key}>{key}={value}</span>)}</div>}<button type="button" className="inspect-hint inspect-button" data-testid={`button-inspect-${entry.id}`} onClick={(event) => { event.stopPropagation(); openDetails(entry); }}>Inspect details <ChevronRight size={11} /></button></td></tr>)}</tbody></table> : <div>{displayedEntries.map((entry) => <div key={entry.id} className={`list-entry ${selectedEntry?.id === entry.id ? 'selected' : ''}`} data-testid={`list-log-${entry.id}`} tabIndex={0} role="button" aria-label={`Inspect line ${entry.line}: ${entry.message}`} onClick={() => setSelectedId(entry.id)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') setSelectedId(entry.id); }}><div className="list-top"><span className={`level-badge ${entry.level.toLowerCase()}`}>{entry.level}</span><span className="mono">line {entry.line}</span><span className="mono">{entry.timestamp}</span><button type="button" className="inspect-hint inspect-button" data-testid={`button-inspect-${entry.id}`} onClick={(event) => { event.stopPropagation(); openDetails(entry); }}>Inspect <ChevronRight size={11} /></button></div><div className="list-message">{entry.message}</div><div className="list-raw">{entry.raw}</div></div>)}</div>}
+                 {loading ? <div className="empty-logs"><div><div className="skeleton" style={{ width: 180, height: 10, margin: '0 auto 14px' }} /><div className="skeleton" style={{ width: 270, height: 10, margin: '0 auto 8px' }} /><div className="skeleton" style={{ width: 220, height: 10, margin: '0 auto' }} /></div></div> : !activeSource || !visibleEntries.length ? <div className="empty-logs" data-testid="state-empty-logs"><List size={24} /><div><h3>{activeSource?.entries.length ? t('No matching entries') : t('Nothing to inspect yet')}</h3><p>{activeSource?.entries.length ? t('Try a different search term or level filter.') : t('Open a local log and the monitor will keep its raw lines alongside every inferred field.')}</p></div></div> : view === 'table' ? <table className="log-table"><thead><tr><th>{t('Line number')}</th><th>{t('Timestamp')}</th><th>{t('Level')}</th><th>{t('Message / inferred fields')}</th></tr></thead><tbody>{displayedEntries.map((entry) => <tr key={entry.id} className={`log-row ${selectedEntry?.id === entry.id ? 'selected' : ''}`} data-testid={`row-log-${entry.id}`} tabIndex={0} role="button" aria-label={t('Inspect line {0}: {1}', String(entry.line), entry.message)} onClick={() => setSelectedId(entry.id)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') setSelectedId(entry.id); }}><td className="line-number">{String(entry.line).padStart(4, '0')}</td><td className="time-cell">{entry.timestamp}</td><td><span className={`level-badge ${entry.level.toLowerCase()}`}>{t(entry.level)}</span></td><td className="message-cell"><div>{entry.message}</div>{Object.entries(entry.fields).length > 0 && <div style={{ marginTop: 5 }}>{Object.entries(entry.fields).slice(0, 4).map(([key, value]) => <span className="field-chip" key={key}>{key}={value}</span>)}</div>}<button type="button" className="inspect-hint inspect-button" data-testid={`button-inspect-${entry.id}`} onClick={(event) => { event.stopPropagation(); openDetails(entry); }}>{t('Inspect details')} <ChevronRight size={11} /></button></td></tr>)}</tbody></table> : <div>{displayedEntries.map((entry) => <div key={entry.id} className={`list-entry ${selectedEntry?.id === entry.id ? 'selected' : ''}`} data-testid={`list-log-${entry.id}`} tabIndex={0} role="button" aria-label={t('Inspect line {0}: {1}', String(entry.line), entry.message)} onClick={() => setSelectedId(entry.id)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') setSelectedId(entry.id); }}><div className="list-top"><span className={`level-badge ${entry.level.toLowerCase()}`}>{t(entry.level)}</span><span className="mono">{t('Line')} {entry.line}</span><span className="mono">{entry.timestamp}</span><button type="button" className="inspect-hint inspect-button" data-testid={`button-inspect-${entry.id}`} onClick={(event) => { event.stopPropagation(); openDetails(entry); }}>{t('Inspect')} <ChevronRight size={11} /></button></div><div className="list-message">{entry.message}</div><div className="list-raw">{entry.raw}</div></div>)}</div>}
               </div>
             </div>
 
@@ -717,7 +791,7 @@ function Home() {
               <div className="inspector-header"><span className="inspector-title">{t('Entry inspector')}</span>{selectedEntry && <span className="mono">#{selectedEntry.line}</span>}</div>
               {!selectedEntry ? <div className="inspector-empty" data-testid="state-empty-inspector"><Info size={20} /><p>{t('Select an entry to see parsed fields and its untouched source line.')}</p></div> : <div className="inspector-body fade-in">
                 <div className="detail-section"><div className="detail-label">{t('Message')}</div><div className="detail-value" data-testid="text-selected-message">{selectedEntry.message}</div></div>
-                 <div className="detail-section"><div className="detail-label">Classification</div><div className="kv-list"><div className="kv"><span>{t('Source format')}</span><span data-testid="text-selected-format">{selectedEntry.format}</span></div><div className="kv"><span>{t('Parser result')}</span><span style={{ color: selectedEntry.parsed ? 'hsl(var(--accent))' : 'hsl(var(--primary))' }}>{selectedEntry.parsed ? t('Inferred') : t('Raw fallback')}</span></div><div className="kv"><span>{t('Timestamp')}</span><span>{selectedEntry.timestamp}</span></div><div className="kv"><span>{t('Severity')}</span><span>{selectedEntry.level}</span></div></div></div>
+                 <div className="detail-section"><div className="detail-label">{t('Classification')}</div><div className="kv-list"><div className="kv"><span>{t('Source format')}</span><span data-testid="text-selected-format">{t(selectedEntry.format)}</span></div><div className="kv"><span>{t('Parser result')}</span><span style={{ color: selectedEntry.parsed ? 'hsl(var(--accent))' : 'hsl(var(--primary))' }}>{selectedEntry.parsed ? t('Inferred') : t('Raw fallback')}</span></div><div className="kv"><span>{t('Timestamp')}</span><span>{selectedEntry.timestamp}</span></div><div className="kv"><span>{t('Severity')}</span><span>{t(selectedEntry.level)}</span></div></div></div>
                  <div className="detail-section diagnosis"><div className="detail-label">{t('What this points to')}</div><div className="diagnosis-title">{diagnosisFor(selectedEntry).title}</div><p className="diagnosis-summary">{diagnosisFor(selectedEntry).summary}</p><ul className="diagnosis-actions">{diagnosisFor(selectedEntry).actions.map((action) => <li key={action}>{action}</li>)}</ul></div>
                 <div className="detail-section"><div className="detail-label">{t('Source confidence')}</div><div className="confidence"><div className="confidence-track"><div className="confidence-fill" style={{ width: `${activeSource?.confidence ?? 0}%` }} /></div><span className="mono" data-testid="text-selected-confidence">{activeSource?.confidence ?? 0}%</span></div></div>
                 <div className="detail-section"><div className="detail-label">{t('Inferred fields')}</div>{Object.entries(selectedEntry.fields).length ? <div className="kv-list">{Object.entries(selectedEntry.fields).map(([key, value]) => <div className="kv" key={key}><span>{key}</span><span>{value}</span></div>)}</div> : <div className="detail-value mono">{t('No additional fields found.')}</div>}</div>
@@ -727,11 +801,11 @@ function Home() {
           </section>
            {detailsOpen && selectedEntry && selectedDiagnosis && <div className="modal-backdrop" data-testid="modal-entry-details" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setDetailsOpen(false); }}>
              <section className="details-modal" role="dialog" aria-modal="true" aria-labelledby="details-modal-title">
-               <div className="modal-header"><div><div className="eyebrow">{t('Live event detail')}</div><h2 id="details-modal-title">{t('Line')} {selectedEntry.line} · {selectedEntry.level}</h2></div><button type="button" className="icon-button" data-testid="button-close-details" aria-label="Close event details" onClick={() => setDetailsOpen(false)}><X size={16} /></button></div>
-               <div className="modal-meta"><span>{activeSource?.name}</span><span className="mono">{selectedEntry.timestamp}</span><span className={`level-badge ${selectedEntry.level.toLowerCase()}`}>{selectedEntry.level}</span></div>
+               <div className="modal-header"><div><div className="eyebrow">{t('Live event detail')}</div><h2 id="details-modal-title">{t('Line')} {selectedEntry.line} · {t(selectedEntry.level)}</h2></div><button type="button" className="icon-button" data-testid="button-close-details" aria-label={t('Close event details')} onClick={() => setDetailsOpen(false)}><X size={16} /></button></div>
+               <div className="modal-meta"><span>{activeSource?.name}</span><span className="mono">{selectedEntry.timestamp}</span><span className={`level-badge ${selectedEntry.level.toLowerCase()}`}>{t(selectedEntry.level)}</span></div>
                <div className="modal-grid"><div className="modal-main"><div className="detail-label">{t('Parsed message')}</div><div className="modal-message">{selectedEntry.message}</div><div className="detail-label">{t('Original raw line')}</div><div className="raw-box modal-raw">{selectedEntry.raw}</div></div><div className="modal-side"><div className="detail-label">{t('Diagnostic interpretation')}</div><div className="diagnosis-title">{selectedDiagnosis.title}</div><p className="diagnosis-summary">{selectedDiagnosis.summary}</p><ul className="diagnosis-actions">{selectedDiagnosis.actions.map((action) => <li key={action}>{action}</li>)}</ul></div></div>
                <div className="modal-fields"><div className="detail-label">{t('Inferred fields')}</div>{Object.entries(selectedEntry.fields).length ? <div className="modal-field-grid">{Object.entries(selectedEntry.fields).map(([key, value]) => <div className="modal-field" key={key}><span>{key}</span><strong>{value}</strong></div>)}</div> : <span className="detail-value mono">{t('No additional fields found.')}</span>}</div>
-               <div className="modal-footer"><span className="mono">{t('Source confidence')} {activeSource?.confidence ?? 0}% · {selectedEntry.format} · raw line preserved</span><button type="button" className="button" data-testid="button-modal-copy-raw" onClick={copyRaw}>{copied ? <CheckCircle2 size={13} /> : <Copy size={13} />} {copied ? t('Copied') : t('Copy raw line')}</button></div>
+               <div className="modal-footer"><span className="mono">{t('Source confidence')} {activeSource?.confidence ?? 0}% · {t(selectedEntry.format)} · {t('raw line preserved')}</span><button type="button" className="button" data-testid="button-modal-copy-raw" onClick={copyRaw}>{copied ? <CheckCircle2 size={13} /> : <Copy size={13} />} {copied ? t('Copied') : t('Copy raw line')}</button></div>
              </section>
            </div>}
           <div style={{ display: 'flex', justifyContent: 'space-between', gap: 14, marginTop: 13, color: 'hsl(var(--muted-foreground))', fontSize: 10 }}>
